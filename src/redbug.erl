@@ -296,7 +296,7 @@ mk_outer(#cnf{print_depth=Depth,print_msec=MS} = Cnf) ->
 
 mk_out(#cnf{print_re=RE,print_file=File}) ->
   fun(F,A) ->
-      Str=flat(F,[A]),
+      Str=flat(F,A),
       case RE =:= "" andalso re:run(Str,RE) =:= nomatch of
         true  -> ok;
         false -> io:fwrite(get_fd(File),"~s~n",[Str])
