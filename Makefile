@@ -1,15 +1,40 @@
-all:
-	./rebar compile escriptize
+REBAR = ./rebar
+
+.PHONY: all compile test clean
+.PHONY: test eunit xref dialyze
+.PHONY: release release_minor release_major release_patch
+
+all: compile
+
+compile:
+	@$(REBAR) compile escriptize
 
 clean:
-	./rebar clean
+	@find . -name "*~" -exec rm {} \;
+	@$(REBAR) clean
 
-changelog:
-	git log --name-only --no-merges \
-	  | grep -Ev "^[ ]+$$|git-svn-id" > ChangeLog
-	echo " Mats Cronqvist <masse@cronqvi.st>" > AUTHORS
-	git log | grep Author | grep -Evi "vagrant|no author|mats cronqvist" \
-	  | sort -u | cut -c8- >> AUTHORS
-#  this only works correctly if we're ahead of origin/master...
-#	git add ChangeLog AUTHORS
-#	git commit --amend --reuse-message HEAD
+test: compile eunit xref dialyze
+
+eunit: all
+	ERL_FLAGS="-sname eunit" $(REBAR) eunit
+
+xref: all
+	@$(REBAR) xref
+
+dialyze: all ~/.dialyzer_plt
+	dialyzer -Wno_return -nn --plt ~/.dialyzer_plt --src src
+
+~/.dialyzer_plt:
+	- dialyzer -nn --output_plt ~/.dialyzer_plt --build_plt \
+           --apps erts kernel stdlib crypto public_key inets eunit xmerl
+
+release_major: test
+	./bin/release.sh major
+
+release_minor: test
+	./bin/release.sh minor
+
+release_patch: test
+	./bin/release.sh patch
+
+release: relase_patch

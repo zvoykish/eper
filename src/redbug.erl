@@ -33,12 +33,13 @@
           %% print-related
           arity        = false,        % arity instead of args
           buffered     = false,        % output buffering
-          print_pids   = false,        % print pids instead of regname
+          discard      = false,        % discard messages (when counting)
           print_calls  = true,         % print calls
           print_file   = "",           % file to print to (standard_io)
           print_msec   = false,        % print milliseconds in timestamps?
           print_depth  = 999999,       % Limit for "~P" formatting depth
           print_re     = "",           % regexp that must match to print
+          print_return = true,         % print return value
           print_fun    = '',           % custom print handler
           %% trc file-related
           file         = "",           % file to write trace msgs to
@@ -92,19 +93,24 @@ help() ->
      , "time         (15000)       stop trace after this many ms"
      , "msgs         (10)          stop trace after this many msgs"
      , "target       (node())      node to trace on"
-     , "arity        (false)       print arity instead of arg list"
      , "blocking     (false)       block start/2, return a list of messages"
-     , "procs        (all)         (list of) Erlang process(es)"
-     , "                           all|pid()|atom(RegName)|{pid,I2,I3}"
-     , "  print-related opts"
+     , "arity        (false)       print arity instead of arg list"
+     , "buffered     (false)       buffer messages till end of trace"
+     , "discard      (false)       discard messages (when counting)"
      , "max_queue    (5000)        fail if internal queue gets this long"
      , "max_msg_size (50000)       fail if seeing a msg this big"
-     , "buffered     (no)          buffer messages till end of trace"
+     , "procs        (all)         (list of) Erlang process(es)"
+     , "                             all|pid()|atom(RegName)|{pid,I2,I3}"
+     , "  print-related opts"
      , "print_calls  (true)        print calls"
      , "print_file   (standard_io) print to this file"
      , "print_msec   (false)       print milliseconds on timestamps"
      , "print_depth  (999999)      formatting depth for \"~P\""
-     , "print_re     (\"\")          print only strings that match this"
+     , "print_re     (\"\")          print only strings that match this RE"
+     , "print_return (true)        print the return value"
+     , "print_fun    ()            custom print handler, fun/1 or fun/2;"
+     , "                             fun(TrcMsg) -> <ignored>"
+     , "                             fun(TrcMsg,AccOld) -> AccNew"
      , "  trc file related opts"
      , "file         (none)        use a trc file based on this name"
      , "file_size    (1)           size of each trc file"
@@ -122,10 +128,10 @@ unix([Node,Trc,Time,Msgs])      -> unix([Node,Trc,Time,Msgs,"all"]);
 unix([Node,Trc,Time,Msgs,Proc]) ->
   try
     Cnf = #cnf{time = to_int(Time),
-               msgs   = to_int(Msgs),
-               trc    = try to_term(Trc) catch _:_ -> Trc end,
-               procs  = [to_atom(Proc)],
-               target = to_atom(Node),
+               msgs      = to_int(Msgs),
+               trc       = try to_term(Trc) catch _:_ -> Trc end,
+               procs     = [to_atom(Proc)],
+               target    = to_atom(Node),
                print_fun = mk_outer(#cnf{})},
     self() ! {start,Cnf},
     init(),
@@ -209,7 +215,7 @@ assert_print_fun(Cnf) ->
 make_print_fun(Cnf) ->
   case Cnf#cnf.blocking of
     false-> mk_outer(Cnf);
-    true -> fun(X,0) -> [X]; (X,A) -> [X|A] end
+    true -> mk_blocker()
   end.
 
 assert_cookie(#cnf{cookie=''}) -> ok;
@@ -256,7 +262,7 @@ init() ->
         R ->
           exit({argument_error,R});
         C:R ->
-          case Cnf#cnf.debug of
+          case Cnf#cnf.debug andalso not Cnf#cnf.blocking of
             false-> ok;
             true -> ?log([{C,R},{stack,erlang:get_stacktrace()}])
           end,
@@ -302,10 +308,25 @@ stopping(Cnf = #cnf{print_pid=PrintPid}) ->
     X                   -> ?log([{unknown_message,X}])
   end.
 
-done(#cnf{blocking=false},{R,A}) ->
-  io:fwrite("redbug done, ~p - ~p~n",[R,A]);
-done(#cnf{blocking=true},R) ->
-  exit(R).
+done(#cnf{blocking=false},{Reason,Answer}) ->
+  io:fwrite("~s",[done_string(Reason)]),
+  io:fwrite("redbug done, ~p - ~p~n",[Reason,Answer]);
+done(#cnf{blocking=true},Reason) ->
+  exit(Reason).
+
+done_string(Reason) ->
+  case is_tuple(Reason) andalso element(1,Reason) of
+    msg_queue ->
+      "you might want to set the max_queue option (see redbug:help/0)\n";
+    stack_size ->
+      "you might want to set the max_msg_size option (see redbug:help/0)\n";
+    arg_length ->
+      "you might want to set the max_msg_size option (see redbug:help/0)\n";
+    arg_size ->
+      "you might want to set the max_msg_size option (see redbug:help/0)\n";
+    _ ->
+      ""
+  end.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 do_start(OCnf) ->
   Cnf = spawn_printer(wrap_print_fun(OCnf),maybe_new_target(OCnf)),
@@ -324,45 +345,89 @@ spawn_printer(PrintFun,Cnf) ->
 
 wrap_print_fun(#cnf{print_fun=PF}) ->
   case erlang:fun_info(PF,arity) of
-    {arity,1} -> fun(M,N) -> PF(M),N+1 end;
+    {arity,1} -> fun(M,N) -> PF(M),maybe_update_count(M,N) end;
     {arity,2} -> PF
+  end.
+
+maybe_update_count(M,N) ->
+  case element(1,M) of
+    call -> N+1;
+    send -> N+1;
+    recv -> N+1;
+    _    -> N
+  end.
+
+mk_blocker() ->
+  fun({_,{_,false},_,_},A)      -> A;
+     ({call_time,{_,[]},_,_},A) -> A;
+     ({call_count,{_,0},_,_},A) -> A;
+     (X,0)                      -> [X];
+     (X,A)                      -> [X|A]
   end.
 
 mk_outer(#cnf{file=[_|_]}) ->
   fun(_) -> ok end;
-mk_outer(#cnf{print_depth=Depth,print_msec=MS,print_pids=PP} = Cnf) ->
+mk_outer(#cnf{print_depth=Depth,print_msec=MS,print_return=Ret} = Cnf) ->
   OutFun = mk_out(Cnf),
   fun({Tag,Data,PI,TS}) ->
       MTS = fix_ts(MS,TS),
       case {Tag,Data} of
-        {'call',{MFA,Bin}} ->
+        {call_time,{_,false}} ->
+          ok;
+        {call_time,{{M,F,A},PerProcCT}} ->
+          PerProc =
+            fun({_,Count,Sec,Usec},{AC,AT}) ->
+                {Count+AC,Sec*1000000+Usec+AT}
+            end,
+          {Count,Time} = lists:foldl(PerProc,{0,0},PerProcCT),
+          [OutFun("~n% ~6s : ~6s : ~w:~w/~w",
+                  [prf:human(Count),prf:human(Time),M,F,A]) || 0 < Count];
+        {'call_count',{_,false}} ->
+          ok;
+        {'call_count',{{M,F,A},Count}} ->
+          [OutFun("~n% ~6s : ~w:~w/~w", [prf:human(Count),M,F,A]) || 0 < Count];
+        {'call',{{M,F,A},Bin}} ->
           case Cnf#cnf.print_calls of
             true ->
-              OutFun("~n~s ~s ~P",[MTS,to_str(PP,PI),MFA,Depth]),
+              case is_integer(A) of
+                true ->
+                  OutFun("~n% ~s ~s~n% ~w:~w/~w",[MTS,to_str(PI),M,F,A]);
+                false->
+                  As = string:join([flat("~P",[E,Depth]) || E <- A],", "),
+                  OutFun("~n% ~s ~s~n% ~w:~w(~s)",[MTS,to_str(PI),M,F,As])
+              end,
               lists:foreach(fun(L)->OutFun("  ~s",[L]) end, stak(Bin));
             false->
               ok
           end;
-        {'retn',{{M,F,A},Val}} ->
-          OutFun("~n~s ~s ~p:~p/~p -> ~P",[MTS,to_str(PP,PI),M,F,A,Val,Depth]);
+        {'retn',{{M,F,A},Val0}} ->
+	  Val = case Ret of
+	          true  -> Val0;
+		  false -> '...'
+		end,
+          OutFun("~n% ~s ~s~n% ~p:~p/~p -> ~P",
+                 [MTS,to_str(PI),M,F,A,Val,Depth]);
         {'send',{MSG,ToPI}} ->
-          OutFun("~n~s ~s ~s <<< ~P",
-                 [MTS,to_str(PP,PI),to_str(PP,ToPI),MSG,Depth]);
+          OutFun("~n% ~s ~s~n% ~s <<< ~P",
+                 [MTS,to_str(PI),to_str(ToPI),MSG,Depth]);
         {'recv',MSG} ->
-          OutFun("~n~s ~s <<< ~P",[MTS,to_str(PP,PI),MSG,Depth])
+          OutFun("~n% ~s ~s~n% <<< ~P",
+                 [MTS,to_str(PI),MSG,Depth])
       end
   end.
 
-to_str(false,{Pid,Reg}) when is_pid(Pid) -> flat("<~p>",[Reg]);
-to_str(true, {Pid,_})   when is_pid(Pid) -> flat("~w",[Pid]);
-to_str(_, PI)                            -> flat("~w",[PI]).
+to_str({Pid,Reg}) ->
+  flat("~w(~p)",[Pid,Reg]);
+to_str(RegisteredName) ->
+  flat("~p", [RegisteredName]).
 
 mk_out(#cnf{print_re=RE,print_file=File}) ->
+  FD = get_fd(File),
   fun(F,A) ->
       Str=flat(F,A),
-      case RE =:= "" andalso re:run(Str,RE) =:= nomatch of
-        true  -> ok;
-        false -> io:fwrite(get_fd(File),"~s~n",[Str])
+      case RE =:= "" orelse re:run(Str,RE) =/= nomatch of
+        true  -> io:fwrite(FD,"~s~n",[Str]);
+        false -> ok
       end
   end.
 
@@ -379,8 +444,10 @@ fix_ts(MS,TS) ->
     false-> ts(TS)
   end.
 
-ts({H,M,S,_Us}) -> flat("~2.2.0w:~2.2.0w:~2.2.0w",[H,M,S]).
-ts_ms({H,M,S,Us}) -> flat("~2.2.0w:~2.2.0w:~2.2.0w.~3.3.0w",[H,M,S,Us div 1000]).
+ts({H,M,S,_Us}) ->
+  flat("~2.2.0w:~2.2.0w:~2.2.0w",[H,M,S]).
+ts_ms({H,M,S,Us}) ->
+  flat("~2.2.0w:~2.2.0w:~2.2.0w.~3.3.0w",[H,M,S,Us div 1000]).
 
 flat(Form,List) ->
   lists:flatten(io_lib:fwrite(Form,List)).
@@ -418,6 +485,7 @@ mfaf(I) ->
 %%% Tag = time | flags | rtps | procs | where
 %%% Where = {term_buffer,{Pid,Count,MaxQueue,MaxSize}} |
 %%%         {term_stream,{Pid,Count,MaxQueue,MaxSize}} |
+%%%         {term_discard,{Pid,Count,MaxQueue,MaxSize}} |
 %%%         {file,File,Size,Count} |
 %%%         {ip,Port,Queue}
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -443,7 +511,7 @@ conf_file(Cnf) ->
   {file,Cnf#cnf.file,Cnf#cnf.file_size,Cnf#cnf.file_count}.
 
 conf_term(Cnf) ->
-  {chk_buffered(Cnf#cnf.buffered),
+  {chk_buffered(Cnf#cnf.buffered,Cnf#cnf.discard),
    {Cnf#cnf.print_pid,
     chk_msgs(Cnf#cnf.msgs),
     Cnf#cnf.max_queue,
@@ -455,8 +523,9 @@ maybe_arity(_,Flags)                -> Flags.
 chk_time(Time) when is_integer(Time) -> Time;
 chk_time(X) -> throw({bad_time,X}).
 
-chk_buffered(true)  -> term_buffer;
-chk_buffered(false) -> term_stream.
+chk_buffered(_,true)  -> term_discard;
+chk_buffered(true,_)  -> term_buffer;
+chk_buffered(false,_) -> term_stream.
 
 chk_proc(Pid) when is_pid(Pid) -> Pid;
 chk_proc(Atom) when is_atom(Atom)-> Atom;
@@ -470,31 +539,10 @@ chk_msgs(X) -> throw({bad_msgs,X}).
 
 chk_trc('send',{Flags,RTPs})                   -> {['send'|Flags],RTPs};
 chk_trc('receive',{Flags,RTPs})                -> {['receive'|Flags],RTPs};
-chk_trc('arity',{Flags,RTPs})                  -> {['arity'|Flags],RTPs};
 chk_trc(RTP,{Flags,RTPs}) when ?is_string(RTP) -> {Flags,[chk_rtp(RTP)|RTPs]};
-chk_trc(RTP,{Flags,RTPs}) when is_tuple(RTP)   -> {Flags,[chk_rtp(RTP)|RTPs]};
 chk_trc(X,_)                                   -> throw({bad_trc,X}).
 
--define(is_aal(M,F,MS), is_atom(M),is_atom(F),is_list(MS)).
-
-chk_rtp(Str) when ?is_string(Str)      -> redbug_msc:transform(Str);
-chk_rtp({M})                           -> chk_rtp({M,'_',[]});
-chk_rtp({M,F}) when is_atom(F)         -> chk_rtp({M,F,[]});
-chk_rtp({M,L}) when is_list(L)         -> chk_rtp({M,'_',L});
-chk_rtp({'_',_,_})                     -> throw(dont_wildcard_module);
-chk_rtp({M,F,MS}) when ?is_aal(M,F,MS) -> {{M,F,'_'},ms(MS),[local]};
-chk_rtp(X)                             -> throw({bad_rtp,X}).
-
-ms(MS) -> lists:foldl(fun msf/2, [{'_',[],[]}], MS).
-
-msf(stack,[{Head,Cond,Body}]) -> [{Head,Cond,[{message,{process_dump}}|Body]}];
-msf(return,[{Head,Cond,Body}])-> [{Head,Cond,[{return_trace}|Body]}];
-msf(Ari, [{_,Cond,Body}]) when is_integer(Ari)-> [{mk_head(Ari),Cond,Body}];
-msf({Head,Cond},[{_,_,Body}]) when is_tuple(Head)->[{Head,slist(Cond),Body}];
-msf(Head, [{_,Cond,Body}]) when is_tuple(Head)-> [{Head,Cond,Body}];
-msf(X,_) -> throw({bad_match_spec,X}).
-
-mk_head(N) -> erlang:make_tuple(N,'_').
+chk_rtp(Str) -> redbug_msc:transform(Str).
 
 slist(S) when ?is_string(S) -> [S];
 slist(L) when is_list(L) -> lists:usort(L);

@@ -10,7 +10,6 @@
 -author('Mats Cronqvist').
 
 -export([transform/1]).
--export([unit_loud/0,unit_quiet/0]).
 
 -define(is_string(Str),
         (Str=="" orelse (9=<hd(Str) andalso hd(Str)=<255))).
@@ -27,24 +26,34 @@ to_string(X)                    -> exit({illegal_input,X}).
 %% returns {{Module,Function,Arity},[{Head,Cond,Body}],[Flag]}
 %% i.e. the args to erlang:trace_pattern/3
 
-compile({M,F,Ari,[],Actions}) when is_integer(Ari) ->
-  compile({M,F,lists:duplicate(Ari,{var,'_'}),[],Actions});
-compile({M,OF,As,Gs,Actions}) ->
-  {F,A,Flags} = chk_fa(OF,As),
+compile({Mod,F,As,Gs,Acts}) ->
+  {Fun,Arg}   = chk_fa(F,As),
   {Vars,Args} = compile_args(As),
-  {{M,F,A}, [{Args,compile_guards(Gs,Vars),compile_acts(Actions)}], Flags}.
+  Guards      = compile_guards(Gs,Vars),
+  Actions     = compile_acts(Acts),
+  Flags       = compile_flags(F,Acts),
+  {{Mod,Fun,Arg},[{Args,Guards,Actions}],Flags}.
 
-chk_fa('X',_) -> {'_','_',[global]};
-chk_fa('_',_) -> {'_','_',[local]};
-chk_fa(F,'_') -> {F,'_',[local]};
-chk_fa(F,As)  -> {F,length(As),[local]}.
+chk_fa(' ',_) -> {'_','_'};
+chk_fa(F,'_') -> {F,  '_'};
+chk_fa(F,As)  -> {F,length(As)}.
+
+compile_flags(F,Acts) ->
+  LG =
+    case F of
+      ' ' -> global;
+      _   -> local
+    end,
+  lists:foldr(fun(E,A)->try [fl_fun(E)|A] catch _:_ -> A end end,[LG],Acts).
+
+fl_fun("count") -> call_count;
+fl_fun("time")  -> call_time.
 
 compile_acts(As) ->
-  [ac_fun(A)|| A <- As].
+  lists:foldr(fun(E,A)->try [ac_fun(E)|A] catch _:_ -> A end end,[],As).
 
 ac_fun("stack") -> {message,{process_dump}};
-ac_fun("return")-> {exception_trace};
-ac_fun(X)       -> exit({unknown_action,X}).
+ac_fun("return")-> {exception_trace}.
 
 compile_guards(Gs,Vars) ->
   {Vars,O} = lists:foldr(fun gd_fun/2,{Vars,[]},Gs),
@@ -60,10 +69,15 @@ gd_fun({Op,V1,V2},{Vars,O}) ->               % binary
 unpack_op(Op,As,Vars) ->
   list_to_tuple([Op|[unpack_var(A,Vars)||A<-As]]).
 
+unpack_var({bin,Bs},_) ->
+  {value,Bin,[]} = erl_eval:expr({bin,1,Bs},[]),
+  Bin;
 unpack_var({tuple,Es},Vars) ->
   {list_to_tuple([unpack_var(E,Vars)||E<-Es])};
 unpack_var({list,Es},Vars) ->
   [unpack_var(E,Vars)||E<-Es];
+unpack_var({string,S},_) ->
+  S;
 unpack_var({var,Var},Vars) ->
   case proplists:get_value(Var,Vars) of
     undefined -> exit({unbound_variable,Var});
@@ -82,6 +96,9 @@ compile_args('_') ->
 compile_args(As) ->
   lists:foldl(fun ca_fun/2,{[],[]},As).
 
+ca_fun({bin,Bs},{Vars,O}) ->
+  {value,Bin,[]} = erl_eval:expr({bin,1,Bs},[]),
+  {Vars,O++[Bin]};
 ca_fun({list,Es},{Vars,O}) ->
   {Vs,Ps} = ca_fun_list(Es,Vars),
   {Vs,O++[Ps]};
@@ -127,7 +144,7 @@ assert_type(Type,Val) ->
 %%   "a:b(X,Y)when is_record(X,rec) and Y==0, (X==z)"
 %%   "a:b->stack", "a:b(X)whenX==2->return"
 %% returns
-%%   {atom(M),atom(F),list(Arg)|integer(Arity),list(Guard),list(Action)}
+%%   {atom(M),atom(F),list(Arg)|atom('_'),list(Guard),list(Action)}
 parse(Str) ->
   {Body,Guard,Action} = assert(split_fun(Str),{split_string,Str}),
   {M,F,A}             = assert(body_fun(Body),{parse_body,Str}),
@@ -146,16 +163,10 @@ split_fun(Str) ->
           nomatch       -> {Str,""}
         end,
       % strip off the guards, if any
-      {S,Guard} =
+      {Body,Guard} =
         case re:run(St,"^(.+[\\s)])+when\\s(.+)\$",[{capture,[1,2],list}]) of
           {match,[Y,G]} -> {Y,G};
           nomatch       -> {St,""}
-        end,
-      % add a wildcard F, if Body is just an atom (presumably a module)
-      Body =
-        case re:run(S,"^\\s*[a-zA-Z0-9_]+\\s*\$") of
-          nomatch -> S;
-          _       -> S++":'_'"
         end,
       {Body,Guard,Action}
   end.
@@ -165,19 +176,21 @@ body_fun(Str) ->
       {done,{ok,Toks,1},[]} = erl_scan:tokens([],Str++". ",1),
       case erl_parse:parse_exprs(Toks) of
         {ok,[{op,1,'/',{remote,1,{atom,1,M},{atom,1,F}},{integer,1,Ari}}]} ->
-          {M,F,Ari};
+          {M,F,lists:duplicate(Ari,{var,'_'})}; % m:f/2
         {ok,[{call,1,{remote,1,{atom,1,M},{atom,1,F}},Args}]} ->
-          {M,F,[arg(A) || A<-Args]};
+          {M,F,[arg(A) || A<-Args]};            % m:f(...)
         {ok,[{call,1,{remote,1,{atom,1,M},{var,1,'_'}},Args}]} ->
-          {M,'_',[arg(A) || A<-Args]};
+          {M,' ',[arg(A) || A<-Args]};          % m:_(...)
         {ok,[{call,1,{remote,1,{atom,1,M},{var,1,_}},Args}]} ->
-          {M,'X',[arg(A) || A<-Args]};
+          {M,' ',[arg(A) || A<-Args]};          % m:V(...)
         {ok,[{remote,1,{atom,1,M},{atom,1,F}}]} ->
-          {M,F,'_'};
+          {M,F,'_'};                            % m:f
         {ok,[{remote,1,{atom,1,M},{var,1,'_'}}]} ->
-          {M,'_','_'};
+          {M,' ','_'};                          % m:_
         {ok,[{remote,1,{atom,1,M},{var,1,_}}]} ->
-          {M,'X','_'};
+          {M,' ','_'};                          % m:V
+        {ok,[{atom,1,M}]} ->
+          {M,'_','_'};                          % m
         {ok,C} ->
           exit({this_is_too_confusing,C})
      end
@@ -220,172 +233,441 @@ arg_list(V)            -> arg(V).
 
 actions_fun(Str) ->
   fun() ->
-      string:tokens(Str,";,")
+      Acts = string:tokens(Str,";,"),
+      [exit({unknown_action,A}) || A <- Acts, not lists:member(A,acts())],
+      Acts
   end.
+
+acts() ->
+  ["stack","return","time","count"].
 
 assert(Fun,Tag) ->
   try Fun()
   catch
     _:{this_is_too_confusing,C}  -> exit({syntax_error,{C,Tag}});
     _:{_,{error,{1,erl_parse,L}}}-> exit({syntax_error,{lists:flatten(L),Tag}});
+    _:{unknown_action,A}         -> exit({syntax_error,{unknown_action,A}});
     _:R                          -> exit({R,Tag,erlang:get_stacktrace()})
   end.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%% ad-hoc unit testing
+%%% eunit tests
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
-unit_loud() ->
-  lists:foreach(fun(R)->io:fwrite("~p~n",[R])end,unit()).
+t_0_test() ->
+  ?assert(
+     unit(
+       {"f:c(<<>>)",
+        {{f,c,1},
+         [{[<<>>],[],[]}],
+         [local]}})).
+t_1_test() ->
+  ?assert(
+     unit(
+       {"f:c(0.1)",
+        bad_type})).
+t_2_test() ->
+  ?assert(
+     unit(
+       {"f:c(<0.0.1>)",
+        syntax_error})).
+t_8_test() ->
+  ?assert(
+     unit(
+       {1,
+        illegal_input})).
+t9_test() ->
+  ?assert(
+     unit(
+       {erlang,
+        {{erlang,'_','_'},
+         [{'_',[],[]}],
+         [local]}})).
+t01_test() ->
+  ?assert(
+     unit(
+       {"a when element(1,'$_')=/=b",
+        {{a,'_','_'},
+         [{'_',[{'=/=',{element,1,'$_'},b}],[]}],
+         [local]}})).
+t02_test() ->
+  ?assert(
+     unit(
+       {"erlang when tl(hd('$_'))=={}",
+        {{erlang,'_','_'},
+         [{'_',[{'==',{tl,{hd,'$_'}},{{}}}],[]}],
+         [local]}})).
+t03_test() ->
+  ?assert(
+     unit(
+       {"a:b when element(1,'$_')=/=c",
+        {{a,b,'_'},
+         [{'_',[{'=/=',{element,1,'$_'},c}],[]}],
+         [local]}})).
+t04_test() ->
+  ?assert(
+     unit(
+       {"a",
+        {{a,'_','_'},
+         [{'_',[],[]}],
+         [local]}})).
+t05_test() ->
+  ?assert(
+     unit(
+       {"a->stack",
+        {{a,'_','_'},
+         [{'_',[],[{message,{process_dump}}]}],
+         [local]}})).
+t06_test() ->
+  ?assert(
+     unit(
+       {"a:b",
+        {{a,b,'_'},
+         [{'_',[],[]}],
+         [local]}})).
+t07_test() ->
+  ?assert(
+     unit(
+       {"a:b->return ",
+        {{a,b,'_'},
+         [{'_',[],[{exception_trace}]}],
+         [local]}})).
+t08_test() ->
+  ?assert(
+     unit(
+       {"a:b/2",
+        {{a,b,2},
+         [{['_','_'],[],[]}],
+         [local]}})).
+t09_test() ->
+  ?assert(
+     unit(
+       {"a:b/2->return",
+        {{a,b,2},
+         [{['_','_'],[],[{exception_trace}]}],
+         [local]}})).
+t10_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,Y)",
+        {{a,b,2},
+         [{['$1','$2'],[],[]}],
+         [local]}})).
+t11_test() ->
+  ?assert(
+     unit(
+       {"a:b(_,_)",
+        {{a,b,2},
+         [{['_','_'],[],[]}],
+         [local]}})).
+t12_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,X)",
+        {{a,b,2},
+         [{['$1','$1'],[],[]}],
+         [local]}})).
+t13_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,y)",
+        {{a,b,2},
+         [{['$1',y],[],[]}],
+         [local]}})).
+t14_test() ->
+  ?assert(
+     unit(
+       {"a:foo()when a==b",
+        {{a,foo,0},
+         [{[],[{'==',a,b}],[]}],
+         [local]}})).
+t15_test() ->
+  ?assert(
+     unit(
+       {"a:foo when a==b",
+        {{a,foo,'_'},
+         [{'_',[{'==',a,b}],[]}],
+         [local]}})).
+t16_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,1)",
+        {{a,b,2},
+         [{['$1',1],[],[]}],
+         [local]}})).
+t17_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,\"foo\")",
+        {{a,b,2},
+         [{['$1',"foo"],[],[]}],
+         [local]}})).
+t18_test() ->
+  ?assert(
+     unit(
+       {"x:y({A,{B,A}},A)",
+        {{x,y,2},
+         [{[{'$1',{'$2','$1'}},'$1'],[],[]}],
+         [local]}})).
+t19_test() ->
+  ?assert(
+     unit(
+       {"x:y(A,[A,{B,[B,A]},A],B)",
+        {{x,y,3},
+         [{['$1',['$1',{'$2',['$2','$1']},'$1'],'$2'],[],[]}],
+         [local]}})).
+t20_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,y)when is_atom(Y)",
+        unbound_variable})).
+t21_test() ->
+  ?assert(
+     unit(
+       {"x:c([string])",
+        {{x,c,1},[{[[string]],[],[]}],
+         [local]}})).
+t22_test() ->
+  ?assert(
+     unit(
+       {"x(s)",
+        syntax_error})).
+t23_test() ->
+  ?assert(
+     unit(
+       {"x-s",
+        syntax_error})).
+t24_test() ->
+  ?assert(
+     unit(
+       {"x:c(S)when S==x;S==y",
+        {{x,c,1},
+         [{['$1'],[{'orelse',{'==','$1',x},{'==','$1',y}}],[]}],
+         [local]}})).
+t25_test() ->
+  ?assert(
+     unit(
+       {"x:c(S)when (S==x)or(S==y)",
+        {{x,c,1},
+         [{['$1'],[{'or',{'==','$1',x},{'==','$1',y}}],[]}],
+         [local]}})).
+t26_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,Y)when is_record(X,rec) and (Y==0), (X==z)",
+        {{a,b,2},
+         [{['$1','$2'],
+           [{'and',{is_record,'$1',rec},{'==','$2',0}},{'==','$1',z}],[]}],
+         [local]}})).
+t27_test() ->
+  ?assert(
+     unit(
+       {"x:y(z)->bla",
+        syntax_error})).
+t28_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,y)when not is_atom(X)",
+        {{a,b,2},
+         [{['$1',y],[{'not',{is_atom,'$1'}}],[]}],
+         [local]}})).
+t29_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,Y)when X==1,Y=/=a",
+        {{a,b,2},
+         [{['$1','$2'],[{'==','$1',1},{'=/=','$2',a}],[]}],
+         [local]}})).
+t30_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,y)when not is_atom(X) -> return",
+        {{a,b,2},
+         [{['$1',y],[{'not',{is_atom,'$1'}}],[{exception_trace}]}],
+         [local]}})).
+t31_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,y)when element(1,X)==foo, (X==z)",
+        {{a,b,2},
+         [{['$1',y],[{'==',{element,1,'$1'},foo},{'==','$1',z}],[]}],
+         [local]}})).
+t32_test() ->
+  ?assert(
+     unit(
+       {"a:b(X,X) -> return;stack",
+        {{a,b,2},
+         [{['$1','$1'],[],[{exception_trace},{message,{process_dump}}]}],
+         [local]}})).
+t33_test() ->
+  ?assert(
+     unit(
+       {"x:y(A,[A,B,C])when A==B,is_atom(C)",
+        {{x,y,2},
+         [{['$1',['$1','$2','$3']],[{'==','$1','$2'},{is_atom,'$3'}],[]}],
+         [local]}})).
+t34_test() ->
+  ?assert(
+     unit(
+       {"x:y([A,B,C])when A=/=B,is_atom(C)",
+        {{x,y,1},
+         [{[['$1','$2','$3']],[{'=/=','$1','$2'},{is_atom,'$3'}],[]}],
+         [local]}})).
+t35_test() ->
+  ?assert(
+     unit(
+       {"a:b([A,B,T])when B==T",
+        {{a,b,1},
+         [{[['$1','$2','$3']],[{'==','$2','$3'}],[]}],
+         [local]}})).
+t36_test() ->
+  ?assert(
+     unit(
+       {"x:y([C|{D}])when is_atom(C)",
+        {{x,y,1},
+         [{[['$1'|{'$2'}]],[{is_atom,'$1'}],[]}],
+         [local]}})).
+t37_test() ->
+  ?assert(
+     unit(
+       {"lists:reverse(\"ab\"++_)",
+        {{lists,reverse,1},
+         [{[[97,98|'_']],[],[]}],
+         [local]}})).
+t38_test() ->
+  ?assert(
+     unit(
+       {"lists:reverse(\"ab\"++C)when 3<length(C)",
+        {{lists,reverse,1},
+         [{[[97,98|'$1']],[{'<',3,{length,'$1'}}],[]}],
+         [local]}})).
+t39_test() ->
+  ?assert(
+     unit(
+       {"a:b([$a,$b|C])",
+        {{a,b,1},[{[[97,98|'$1']],[],[]}],
+         [local]}})).
+t40_test() ->
+  ?assert(
+     unit(
+       {"a:_(a)",
+        {{a,'_','_'},
+         [{[a],[],[]}],
+         [global]}})).
+t41_test() ->
+  ?assert(
+     unit(
+       {"a:_",
+        {{a,'_','_'},[{'_',[],[]}],
+         [global]}})).
+t42_test() ->
+  ?assert(
+     unit(
+       {"a:_->return",
+        {{a,'_','_'},
+         [{'_',[],[{exception_trace}]}],
+         [global]}})).
+t43_test() ->
+  ?assert(
+     unit(
+       {"erlang:_({A}) when hd(A)=={}",
+        {{erlang,'_','_'},
+         [{[{'$1'}],[{'==',{hd,'$1'},{{}}}],[]}],
+         [global]}})).
+t44_test() ->
+  ?assert(
+     unit(
+       {"a:X([]) -> return,stack",
+        {{a,'_','_'},
+         [{[[]],[],[{exception_trace},{message,{process_dump}}]}],
+         [global]}})).
+t45_test() ->
+  ?assert(
+     unit(
+       {"lists:X([a])",
+        {{lists,'_','_'},
+         [{[[a]],[],[]}],
+         [global]}})).
+t46_test() ->
+  ?assert(
+     unit(
+       {"lists:X(A) when is_list(A)",
+        {{lists,'_','_'},
+         [{['$1'],[{is_list,'$1'}],[]}],
+         [global]}})).
+t47_test() ->
+  ?assert(
+     unit(
+       {"lists:X",
+        {{lists,'_','_'},
+         [{'_',[],[]}],
+         [global]}})).
+t48_test() ->
+  ?assert(
+     unit(
+       {"x:c(A)when [A,A] == [A]++[A]",
+        {{x,c,1},
+         [{['$1'],[{'==',['$1','$1'],{'++',['$1'],['$1']}}],[]}],
+         [local]}})).
+t49_test() ->
+  ?assert(
+     unit(
+       {"x:c(Aw)hen [A,A] == [A]++[A]",
+        syntax_error})).
 
-unit_quiet() ->
-  [R||R<-unit(),is_tuple(R)].
+t50_test() ->
+  ?assert(
+     unit(
+       {"f:m(<<1,\"abc\">>)",
+        {{f,m,1},
+         [{[<<1,$a,$b,$c>>],[],[]}],
+         [local]}})).
 
-unit() ->
-  lists:foldr(
-    fun(Str,O)->[unit(Str)|O]end,[],
-    [{"a when element(1,'$_')=/=b",
-      {{a,'_','_'},
-       [{'_',[{'=/=',{element,1,'$_'},b}],[]}],[local]}}
-     ,{"erlang when tl(hd('$_'))=={}",
-       {{erlang,'_','_'},
-        [{'_',[{'==',{tl,{hd,'$_'}},{{}}}],[]}],
-        [local]}}
-     ,{"a:b when element(1,'$_')=/=c",
-       {{a,b,'_'},
-        [{'_',[{'=/=',{element,1,'$_'},c}],[]}],[local]}}
-     ,{"a",
-       {{a,'_','_'},[{'_',[],[]}],[local]}}
-     ,{"a->stack",
-       {{a,'_','_'},[{'_',[],[{message,{process_dump}}]}],[local]}}
-     ,{"a:b",
-       {{a,b,'_'},[{'_',[],[]}],[local]}}
-     ,{"a:b->return ",
-       {{a,b,'_'},[{'_',[],[{exception_trace}]}],[local]}}
-     ,{"a:b/2",
-       {{a,b,2},[{['_','_'],[],[]}],[local]}}
-     ,{"a:b/2->return",
-       {{a,b,2},[{['_','_'],[],[{exception_trace}]}],[local]}}
-     ,{"a:b(X,Y)",
-       {{a,b,2},[{['$1','$2'],[],[]}],[local]}}
-     ,{"a:b(_,_)",
-       {{a,b,2},[{['_','_'],[],[]}],[local]}}
-     ,{"a:b(X,X)",
-       {{a,b,2},[{['$1','$1'],[],[]}],[local]}}
-     ,{"a:b(X,y)",
-       {{a,b,2},[{['$1',y],[],[]}],[local]}}
-     ,{"a:foo()when a==b",
-       {{a,foo,0},[{[],[{'==',a,b}],[]}],[local]}}
-     ,{"a:foo when a==b",
-       {{a,foo,'_'},[{'_',[{'==',a,b}],[]}],[local]}}
-     ,{"a:b(X,1)",
-       {{a,b,2},[{['$1',1],[],[]}],[local]}}
-     ,{"a:b(X,\"foo\")",
-       {{a,b,2},[{['$1',"foo"],[],[]}],[local]}}
-     ,{"x:y({A,{B,A}},A)",
-       {{x,y,2},[{[{'$1',{'$2','$1'}},'$1'],[],[]}],[local]}}
-     ,{"x:y(A,[A,{B,[B,A]},A],B)",
-       {{x,y,3},[{['$1',['$1',{'$2',['$2','$1']},'$1'],'$2'],[],[]}],[local]}}
-     ,{"a:b(X,y)when is_atom(Y)",
-       unbound_variable}
-     ,{"x:c([string])",
-       {{x,c,1},[{[[string]],[],[]}],[local]}}
-     ,{"x(s)",
-       syntax_error}
-     ,{"x-s",
-       syntax_error}
-     ,{"x:c(S)when S==x;S==y",
-       {{x,c,1},
-        [{['$1'],[{'orelse',{'==','$1',x},{'==','$1',y}}],[]}],
-        [local]}}
-     ,{"x:c(S)when (S==x)or(S==y)",
-       {{x,c,1},
-        [{['$1'],[{'or',{'==','$1',x},{'==','$1',y}}],[]}],
-        [local]}}
-     ,{"a:b(X,Y)when is_record(X,rec) and (Y==0), (X==z)",
-       {{a,b,2},
-        [{['$1','$2'],
-          [{'and',{is_record,'$1',rec},{'==','$2',0}},{'==','$1',z}],[]}],
-        [local]}}
-     ,{"x:y(z)->bla",
-       unknown_action}
-     ,{"a:b(X,y)when not is_atom(X)",
-       {{a,b,2},[{['$1',y],[{'not',{is_atom,'$1'}}],[]}],[local]}}
-     ,{"a:b(X,Y)when X==1,Y=/=a",
-      {{a,b,2},[{['$1','$2'],[{'==','$1',1},{'=/=','$2',a}],[]}],[local]}}
-     ,{"a:b(X,y)when not is_atom(X) -> return",
-       {{a,b,2},
-        [{['$1',y],[{'not',{is_atom,'$1'}}],[{exception_trace}]}],
-        [local]}}
-     ,{"a:b(X,y)when element(1,X)==foo, (X==z)",
-       {{a,b,2},
-        [{['$1',y],[{'==',{element,1,'$1'},foo},{'==','$1',z}],[]}],
-        [local]}}
-     ,{"a:b(X,X) -> return;stack",
-       {{a,b,2},
-        [{['$1','$1'],[],[{exception_trace},{message,{process_dump}}]}],
-        [local]}}
-     ,{"x:y(A,[A,B,C])when A==B,is_atom(C)",
-       {{x,y,2},
-        [{['$1',['$1','$2','$3']],
-          [{'==','$1','$2'},{is_atom,'$3'}],
-          []}],
-        [local]}}
-     ,{"x:y([A,B,C])when A=/=B,is_atom(C)",
-       {{x,y,1},
-        [{[['$1','$2','$3']],[{'=/=','$1','$2'},{is_atom,'$3'}],[]}],
-        [local]}}
-     ,{"a:b([A,B,T])when B==T",
-       {{a,b,1},
-        [{[['$1','$2','$3']],[{'==','$2','$3'}],[]}],
-        [local]}}
-     ,{"x:y([C|{D}])when is_atom(C)",
-       {{x,y,1},
-        [{[['$1'|{'$2'}]],[{is_atom,'$1'}],[]}],
-        [local]}}
-     ,{"lists:reverse(\"ab\"++_)",
-       {{lists,reverse,1},
-        [{[[97,98|'_']],[],[]}],
-        [local]}}
-     ,{"lists:reverse(\"ab\"++C)when 3<length(C)",
-       {{lists,reverse,1},
-        [{[[97,98|'$1']],[{'<',3,{length,'$1'}}],[]}],
-        [local]}}
-     ,{"a:b([$a,$b|C])",
-       {{a,b,1},[{[[97,98|'$1']],[],[]}],
-        [local]}}
-     ,{"a:_(a)",
-       {{a,'_','_'},[{[a],[],[]}],
-        [local]}}
-     ,{"a:_",
-       {{a,'_','_'},[{'_',[],[]}],
-        [local]}}
-     ,{"a:_->return",
-       {{a,'_','_'},[{'_',[],[{exception_trace}]}],
-        [local]}}
-     ,{"erlang:_({A}) when hd(A)=={}",
-       {{erlang,'_','_'},[{[{'$1'}],[{'==',{hd,'$1'},{{}}}],[]}],
-        [local]}}
-     ,{"a:X([]) -> return,stack",
-       {{a,'_','_'},
-        [{[[]],[],[{exception_trace},{message,{process_dump}}]}],
-        [global]}}
-     ,{"lists:X([a])",
-       {{lists,'_','_'},[{[[a]],[],[]}],
-        [global]}}
-     ,{"lists:X(A) when is_list(A)",
-       {{lists,'_','_'},[{['$1'],[{is_list,'$1'}],[]}],
-        [global]}}
-     ,{"lists:X",
-       {{lists,'_','_'},[{'_',[],[]}],
-        [global]}}
-    ]).
+t51_test() ->
+  ?assert(
+     unit(
+       {"erlang:binary_to_list(A)when A==<<48>>",
+        {{erlang,binary_to_list,1},
+         [{['$1'],[{'==','$1',<<"0">>}],[]}],
+         [local]}})).
+
+t52_test() ->
+  ?assert(
+     unit(
+       {"erlang:binary_to_list(<<48>>)",
+        {{erlang,binary_to_list,1},
+         [{[<<"0">>],[],[]}],
+         [local]}})).
+
+t53_test() ->
+  ?assert(
+     unit(
+       {"erlang:binary_to_list(<<\"0\">>)",
+        {{erlang,binary_to_list,1},
+         [{[<<"0">>],[],[]}],
+         [local]}})).
+
+t54_test() ->
+  ?assert(
+     unit(
+       {"erlang:binary_to_list(<<1:3,1:5>>)",
+        {{erlang,binary_to_list,1},
+         [{[<<"!">>],[],[]}],
+         [local]}})).
+
+t55_test() ->
+  ?assert(
+     unit(
+       {"erlang:binary_to_list(<<1:3,_:5>>)",
+        unbound_var})).
 
 unit({Str,MS}) ->
-  try MS=transform(Str),Str
+  try
+    MS = transform(Str),true
   catch
-    _:{MS,_}       -> Str;
-    _:{{MS,_},_}   -> Str;
-    _:{{MS,_},_,_} -> Str;
-    _:R            -> {Str,R,MS}
+    _:{MS,_} -> true
   end.
+
+-endif. % TEST
